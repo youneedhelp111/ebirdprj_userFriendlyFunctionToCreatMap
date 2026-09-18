@@ -14,3 +14,11 @@
 *.xlsx
 data/ebd_sampling_relJul-2026.txt
 data/ebd_sampling_relJul-2026.txt.gz
+data/
+output/
+raster_output/
+*.tif
+*.tiff
+*.rds
+*.RData
+data/
