@@ -21,6 +21,7 @@
 ##'                           - list(type = "couns") 美国本土
 ##' @param resolution        栅格分辨率: "3km" (默认) / "9km" / "27km"。
 ##' @param metric            丰度统计量: "mean" (默认) / "median" / "lower" / "upper"/ "max"。
+##' @param method            "ebirdst" (默认, 自动下载官方栅格) 或 "custom" (自己建模)。
 ##'
 ##' @param quantile_breaks   是否用十分位分箱 (默认 TRUE)。
 ##' @param n_quantiles       分箱数, 默认 10。
@@ -32,14 +33,14 @@
 ##' @param map_title         地图标题; NULL 自动生成。
 ##' @param crs               投影; "auto" = 按区域质心自动选 LAEA。
 ##' @param verbose           打印进度 (默认 TRUE)。
-##' @param ...               
+##' @param ...               给 method="custom" 的其他参数 (暂存)。
 ##'
 ##' @return 一个 S3 对象 "rel_abundance":
 ##'   r       SpatRaster (裁剪投影后的丰度栅格)
 ##'   region  sf 多边形
 ##'   species, season, call ...
 ##' @export
-map_online <- function(species,
+f.rel.ab <- function(species,
                      season = c("breeding", "nonbreeding",
                                 "prebreeding_migration",
                                 "postbreeding_migration",
@@ -52,6 +53,8 @@ map_online <- function(species,
                                                 country_iso = "US"),
                      resolution          = c("3km", "9km", "27km"),
                      metric              = "mean",
+                     method              = c("ebirdst", "custom"),
+                     
                      quantile_breaks     = TRUE,
                      n_quantiles         = 10,
                      palette             = "ebirdst",
@@ -62,25 +65,33 @@ map_online <- function(species,
                      map_title           = NULL,
                      crs                 = "auto",
                      verbose             = TRUE,
-                     api_key             = "",
                      ...) {
   
   ## ---------- 0. 参数对齐 ----------
   season     <- match.arg(season)
   resolution <- match.arg(resolution)
+  method     <- match.arg(method)
   
   .check_pkgs(c("ebirdst", "rnaturalearth", "rnaturalearthdata",
                 "dplyr", "sf", "terra", "fields", "lubridate"))
   set.seed(1)
   
   if (verbose) message(">>> 物种: ", species,
-                       "  时段: ", season)
-  
-  res <- .run_ebirdst(species = species, season = season,
+                       "  时段: ", season,
+                       "  方法: ", method)
+  tryCatch(
+    ebirdst::set_ebirdst_access_key("6f1db48b-01a7-4097-844a-5e79d50d3d43", overwrite = TRUE),
+    error = function(e) message("(key 已存在, 跳过: ", conditionMessage(e), ")")
+  )
+  if (method == "ebirdst") {
+    res <- .run_ebirdst(species = species, season = season,
                         start_date = start_date, end_date = end_date,
                         week = week, region = region,
                         resolution = resolution, metric = metric,
-                        verbose = verbose, api_key = api_key)
+                        verbose = verbose)
+  } else {
+    res <- .run_custom(...)
+  }
   
   ## ---------- 出图或保存 ----------
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
@@ -119,11 +130,9 @@ map_online <- function(species,
 ##  主路径 A: 自动下载官方 Status & Trends 栅格
 ## ============================================================================
 .run_ebirdst <- function(species, season, start_date, end_date, week,
-                         region, resolution, metric, verbose, api_key) {
+                         region, resolution, metric, verbose) {
   
   ## 1) 物种名 -> 6 位代码; load_raster 也接受俗名, 但我们保险起见查一下
-  if(api_key == "") stop("Put your api key in. get the key on ebird.org! It for map download, not for data")
-  ebirdst::set_ebirdst_access_key(api_key, overwrite = TRUE)
   if (verbose) message(">>> [1/5] 下载/读取物种丰度栅格 (首次运行会自动联网下载) ...")
   ## load_raster 第一次调用即下载, 不需要显式 ebirdst_download_status
   if (season == "year_round") {
@@ -198,11 +207,22 @@ map_online <- function(species,
 
 
 ## ============================================================================
+##  主路径 B: 从清单数据从零建模 (method="custom", 原 v0.1 逻辑)
+## ============================================================================
+.run_custom <- function(...) {
+  
+  stop("method='custom' 需要你已经按 ebird-best-practices 第 2-5 章准备好:",
+       "\n  零填充清单 CSV、环境变量 CSV、预测网格 CSV、gis-data.gpkg。",
+       "\n  v0.2 起默认 method='ebirdst' 直接下载官方栅格; 若要自己建模, 请参考",
+       "\n  f_rel_abundance.R 末尾的示例代码段, 或联系作者恢复完整 pipeline。")
+}
+
+
+## ============================================================================
 ##  辅助函数
 ## ============================================================================
 
 .check_pkgs <- function(pkgs) {
-  lapply(pkgs, library, character.only = TRUE)
   for (p in pkgs) {
     if (!requireNamespace(p, quietly = TRUE))
       stop("缺少 R 包: ", p, "\n  请先 install.packages('", p, "')")
@@ -397,13 +417,11 @@ map_online <- function(species,
 ##  S3 方法
 ## ============================================================================
 print.rel_abundance <- function(x, ...) {
-  cat("== eBird 相对丰度地图 ==\n")
-  cat("  物种 :", x$species, "\n")
-  cat("  时段 :", x$season, "\n")
-  if (!is.null(x$r))
-    cat("  栅格 :", paste(dim(x$r), collapse = " x "), "\n")
-  if (!is.null(x$n_checklists))
-    cat("  清单 :", x$n_checklists, "(建模", x$n_model %||% NA, ")\n")
+  cat("== eBird 相对丰度地图 ==", "\n")
+  cat("  物种   :", x$species, "\n")
+  cat("  时段   :", x$season, "\n")
+  cat("  栅格   :", paste(dim(x$r), collapse = " x "), "\n")
+  cat("  地区   :", x$call$region$type, " ",x$call$region$name)
   invisible(x)
 }
 
@@ -414,3 +432,59 @@ plot.rel_abundance <- function(x, ...) {
                       map_title = paste0(x$species, " — ", x$season),
                       verbose = FALSE)
 }
+
+
+## ============================================================================
+##  示例用法
+## ============================================================================
+##
+## # 0) 首次使用前: 安装并配置 access key (只需一次)
+# install.packages(c("ebirdst","rnaturalearth","rnaturalearthdata",
+#                    "sf","terra","fields","dplyr","lubridate"))
+## # (在 https://ebird.org/data/download 登录后同意条款即可获得 key)
+##
+## # 1) 教程同款: 佐治亚州六月林鸫
+## result <- f.rel.ab(
+##   species = "Wood Thrush",
+##   season  = "breeding",
+##   region  = list(type = "state", name = "Georgia", country_iso = "US")
+## )
+##
+## # 2) 任何自定义日期段 (自动取这段时间内所有周栅格的均值)
+## result2 <- f.rel.ab(
+##   species    = "Wood Thrush",
+##   season     = "custom",
+##   start_date = "2023-04-15",
+##   end_date   = "2023-05-15",
+##   region     = list(type = "state", name = "Georgia")
+## )
+##
+## # 3) 全国越冬季
+# result3 <- f.rel.ab(
+#   species = "Wood Thrush",
+#   season  = "breeding",
+#   region  = list(type = "conus", name = "United States of America"),
+#   metric = "max"
+# )
+##
+## # 4) 直接看某一周
+## result4 <- f.rel.ab(
+##   species = "Wood Thrush", season = "weekly", week = 24,
+##   region  = list(type = "state", name = "Georgia")
+## )
+##
+# 5) 免 key 示例物种, 一键跑通 (适合第一次测试)
+# result_demo <- f.rel.ab(
+#   species = "yebsap-example",
+#   season  = "breeding",
+#   region  = list(type = "state", name = "Michigan", country_iso = "US")
+# )
+
+# result3 <- f.rel.ab(
+#   species = "Wood Thrush",
+#   season = "breeding",
+#   region = list(type = "state",
+#                 name = "Alabama",
+#                 country_iso = "US"),
+#   metric = "mean"
+# )
