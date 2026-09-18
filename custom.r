@@ -1,27 +1,22 @@
 ## ============================================================================
-## f.rel.ab() —— eBird 相对丰度 (relative abundance) 一键出图函数
+## map_local() —— 用本地 eBird 基本数据集 (EBD/SED) 从零建模, 一键出相对丰度图
 ## ----------------------------------------------------------------------------
-## 两种建模/取数方式 (method):
-##   1. "ebirdst" (默认, 快):
-##        直接下载 eBird Status & Trends 官方已发布的相对丰度栅格,
-##        按你选的物种 / 时段 / 地区裁剪投影后出图。需要 eBird 访问密钥。
-##        免密钥示例物种: "yebsap-example"。
+## 你只需要在工程 /data 目录放好 eBird Custom Download 的两个纯文本:
+##   * 清单文件 SED:  文件名里带 "sampling",  例如 ebd_..._sampling_relJul-2026.txt
+##   * 观测文件 EBD:  文件名以 "ebd" 开头但不带 "sampling", 例如 ebd_..._relJul-2026.txt
+##   (在 eBird Custom Download 里勾选 "Include sampling event data" 才会同时给这两个)
+## 函数自动完成:
+##   读取/过滤 -> zero-fill(检测/非检测) -> 努力量派生变量 -> 时空子采样
+##   -> 在线下载环境栅格(土地覆盖+高程, 免密钥) -> 提取环境变量
+##   -> hurdle 双随机森林(遭遇率 RF + SCAM 校准 + 计数 RF)
+##   -> 预测网格 -> 相对丰度 = 校准遭遇率 × 计数 -> 出图
 ##
-##   2. "custom" (从零建模, 慢但完全自主, 复刻官方 Best Practices 第 4-5 章):
-##        你只需要在工程 /data 目录放好 eBird 基本数据集 (EBD) 的两个文本:
-##          * 清单文件 SED:  文件名里带 "sampling",  例如 ebd_..._sampling_relJul-2026.txt
-##          * 观测文件 EBD:  文件名以 "ebd" 开头但不带 "sampling", 例如 ebd_..._relJul-2026.txt
-##        (在 eBird Custom Download 里勾选 "Include sampling event data" 才会同时给这两个)
-##        函数会自动完成:
-##          读取/过滤 -> zero-fill(检测/非检测) -> 努力量派生变量 -> 时空子采样
-##          -> 在线下载环境栅格(土地覆盖+高程, 免密钥) -> 提取环境变量
-##          -> hurdle 双随机森林(遭遇率 RF + SCAM 校准 + 计数 RF)
-##          -> 3km 预测网格 -> 相对丰度 = 校准遭遇率 × 计数 -> 出图
-##
-## 依赖: ebirdst, rnaturalearth, dplyr, sf, terra, fields, lubridate
-##       method="custom" 还需要(首次会自动从 CRAN 安装):
+## 依赖: dplyr, sf, terra, lubridate; 首次会自动从 CRAN 安装
 ##       ranger, scam, mccf1, elevatr, exactextractr, readr, hms, tidyr,
-##       jsonlite, httr
+##       jsonlite, httr, rnaturalearth, rnaturalearthdata, fields
+## ============================================================================
+
+
 ## ============================================================================
 
 ## ----------------------------------------------------------------------------
@@ -65,7 +60,7 @@
 #
 ##' 一键生成 eBird 相对丰度地图
 ##'
-##' @param species         物种英文名 / eBird 代码。custom 法必须是 eBird 英文名
+##' @param species         物种英文名(common name)或学名; 如 "Wood Thrush"。
 ##'                        (与 EBD 里 common_name 一致), 如 "Wood Thrush"。
 ##' @param season          时段: breeding / nonbreeding / prebreeding_migration /
 ##'                        postbreeding_migration / year_round / weekly / custom。
@@ -75,9 +70,6 @@
 ##'                        list(type="conus")                       (美国本土48州)
 ##'                        list(type="none")                        (用数据全范围)
 ##'                        或直接给一个 sf 多边形对象。
-##' @param method          "ebirdst"(默认) 或 "custom"。
-##' @param metric          ebirdst 法的统计量: median/mean/upper/lower。
-##' @param resolution      ebirdst 法分辨率: "3km" 或 "27km"。
 ##' @param week            season="weekly" 时, 第几周 (1-52)。
 ##' @param start_date,end_date  season="custom" 时的起止日期。
 ##' @param data_dir        [custom] EBD/SED 所在目录, 默认 "data"。
@@ -106,9 +98,9 @@
 ##' @return 一个 S3 对象 "rel_abundance":
 ##'   r       SpatRaster (custom 为四层: in_range/encounter_rate/count/abundance,
 ##'                        出图与 print 默认用其中的 abundance 层)
-##'   region  sf 多边形; species, season, method, call ...
+##'   region  sf 多边形; species, season, call ...
 ##' @export
-f.rel.ab <- function(species,
+map_local <- function(species,
                      season = c("breeding", "nonbreeding",
                                 "prebreeding_migration",
                                 "postbreeding_migration",
@@ -116,12 +108,9 @@ f.rel.ab <- function(species,
                                 "weekly", "custom"),
                      region = list(type = "state", name = "Georgia",
                                    country_iso = "US"),
-                     method = c("ebirdst", "custom"),
-                     metric = c("median", "mean", "upper", "lower"),
-                     resolution = c("3km", "27km"),
                      week = NULL,
                      start_date = NULL, end_date = NULL,
-                     ## ---- method="custom" 专用参数 ----
+                     ## ---- 本地建模专用参数 ----
                      data_dir       = "data",
                      ebd_file       = NULL,
                      sed_file       = NULL,
@@ -149,12 +138,8 @@ f.rel.ab <- function(species,
                      ...) {
 
   season <- match.arg(season)
-  method <- match.arg(method)
-  metric <- match.arg(metric)
-  resolution <- match.arg(resolution)
 
-  ## 基础依赖 (两条路径都要用): 检查通过后 attach, 保证用户 source() 后
-  ## 即使没有手动 library(...) 也能直接调用 (函数自包含)。
+  ## 基础依赖: 检查通过后 attach, 保证 source() 后即使没手动 library 也能直接调用
   .check_pkgs(c("dplyr", "sf", "terra", "lubridate"))
   suppressPackageStartupMessages({
     library(dplyr, quietly = TRUE, warn.conflicts = FALSE)
@@ -172,171 +157,29 @@ f.rel.ab <- function(species,
                                                       end_date, week))
   }
 
-  if (method == "ebirdst") {
-    ## ---------------- 路径 A: 官方栅格 ----------------
-    res <- .run_ebirdst(species = species, season = season, region = region,
-                        region_sf = region_sf,
-                        metric = metric, resolution = resolution,
-                        week = week, start_date = start_date,
-                        end_date = end_date,
-                        crs = crs, out_dir = out_dir, out_prefix = out_prefix,
-                        map_title = map_title, do_plot = do_plot,
-                        verbose = verbose, ...)
-  } else {
-    ## ---------------- 路径 B: 从 EBD/SED 从零建模 ----------------
-    res <- .run_custom(species = species, season = season,
-                       region_sf = region_sf,
-                       week = week, start_date = start_date,
-                       end_date = end_date,
-                       data_dir = data_dir, ebd_file = ebd_file,
-                       sed_file = sed_file, year_range = year_range,
-                       grid_res = grid_res, elev_z = elev_z,
-                       lc_agg = lc_agg, sample_radius = sample_radius,
-                       compute_ed = compute_ed,
-                       test_fraction = test_fraction,
-                       ss_cellsize = ss_cellsize, ss_weeks = ss_weeks,
-                       hours_peak = hours_peak, n_trees = n_trees,
-                       env_cache_dir = env_cache_dir, seed = seed,
-                       smooth = smooth,
-                       crs = crs, out_dir = out_dir, out_prefix = out_prefix,
-                       map_title = map_title, do_plot = do_plot,
-                       verbose = verbose, ...)
-  }
+  res <- .run_custom(species = species, season = season,
+                     region_sf = region_sf,
+                     week = week, start_date = start_date,
+                     end_date = end_date,
+                     data_dir = data_dir, ebd_file = ebd_file,
+                     sed_file = sed_file, year_range = year_range,
+                     grid_res = grid_res, elev_z = elev_z,
+                     lc_agg = lc_agg, sample_radius = sample_radius,
+                     compute_ed = compute_ed,
+                     test_fraction = test_fraction,
+                     ss_cellsize = ss_cellsize, ss_weeks = ss_weeks,
+                     hours_peak = hours_peak, n_trees = n_trees,
+                     env_cache_dir = env_cache_dir, seed = seed,
+                     smooth = smooth,
+                     crs = crs, out_dir = out_dir, out_prefix = out_prefix,
+                     map_title = map_title, do_plot = do_plot,
+                     verbose = verbose, ...)
   invisible(res)
 }
 
 ## ============================================================================
-## 2. 路径 A: 官方 eBird Status & Trends 栅格
+## 2. 从 EBD/SED 清单数据从零建模 (hurdle 模型, 复刻官方教程)
 ## ============================================================================
-.run_ebirdst <- function(species, season, region, region_sf,
-                         metric, resolution, week, start_date, end_date,
-                         crs, out_dir, out_prefix, map_title,
-                         do_plot, verbose, ...) {
-  .check_pkgs(c("ebirdst", "rnaturalearth", "rnaturalearthdata", "fields"))
-
-  ## ---- 2.1 物种 -> 6 字母代码 / 下载路径 ----
-  sp_path <- .resolve_species_path(species)
-
-  ## ---- 2.2 时段 -> period / weeks ----
-  sp_season <- .season_to_ebirdst(season, week, start_date, end_date)
-
-  ## ---- 2.3 读取丰度栅格 ----
-  if (verbose) message(">>> [1/5] 下载/读取物种丰度栅格 (首次运行会自动联网下载) ...")
-  r <- tryCatch(
-    ebirdst::load_raster(species = sp_path,
-                         product = "abundance",
-                         period = sp_season$period,
-                         metric = metric,
-                         resolution = resolution),
-    error = function(e) {
-      ## 示例物种只有 27km, 3km 缺失时自动降级
-      if (resolution == "3km" && grepl("27 km", conditionMessage(e))) {
-        message("    (该物种没有 3km 分辨率数据, 自动降级到 27km)")
-        ebirdst::load_raster(species = sp_path, product = "abundance",
-                             period = sp_season$period, metric = metric,
-                             resolution = "27km")
-      } else stop(conditionMessage(e), call. = FALSE)
-    })
-
-  ## weekly: load_raster 返回 52 周, 取目标周
-  if (sp_season$period == "weekly") {
-    wk <- sp_season$week
-    r <- r[[wk]]
-    if (verbose) message(sprintf("    取第 %d 周", wk))
-  }
-  ## custom 日期: 用相邻两周做线性时间插值
-  if (sp_season$period == "custom") {
-    r <- .interp_custom_weeks(sp_path, sp_season$doy, metric, resolution)
-  }
-
-  ## ---- 2.4 投影 ----
-  if (crs == "auto") {
-    crs <- .auto_laea(region_sf)
-  }
-  if (verbose) message(">>> [2/5] 投影研究区 ...")
-  region_proj <- sf::st_transform(region_sf, crs)
-  r_proj <- terra::project(r, crs, method = "bilinear")
-
-  ## ---- 2.5 裁剪/掩膜 ----
-  if (verbose) message(">>> [3/5] 裁剪到研究区 ...")
-  region_v <- terra::vect(region_proj)
-  r_crop <- terra::crop(r_proj, region_v, snap = "out")
-  r_mask <- terra::mask(r_crop, region_v)
-  names(r_mask) <- "abundance"
-
-  ## ---- 2.6 出图 ----
-  if (do_plot) {
-    .plot_rel_abundance(r_mask, region_proj,
-                        quantile_breaks = TRUE, n_quantiles = 10,
-                        palette = "ebirdst",
-                        map_title = map_title, verbose = verbose)
-  }
-
-  ## ---- 2.7 保存 ----
-  .save_outputs(r_mask, species, season, out_dir, out_prefix,
-                week = week, start_date = start_date, end_date = end_date,
-                verbose = verbose)
-
-  structure(list(
-    r = r_mask,
-    region = region_proj,
-    species = species,
-    season = .season_label(season, start_date, end_date, week),
-    method = "ebirdst",
-    metric = metric,
-    resolution = res(r_mask),
-    call = match.call()
-  ), class = "rel_abundance")
-}
-
-## 自定义日期: 在 52 周栅格里按年序日线性插值
-.interp_custom_weeks <- function(sp_path, doy, metric, resolution) {
-  rw <- ebirdst::load_raster(species = sp_path, product = "abundance",
-                             period = "weekly", metric = metric,
-                             resolution = resolution)
-  ## 每周中心的年序日 (第 w 周中心约 (w-1)*7+4)
-  wk_doy <- seq(4, by = 7, length.out = terra::nlyr(rw))
-  ## 找相邻两周
-  k <- findInterval(doy, wk_doy, all.inside = TRUE)
-  w1 <- wk_doy[k]; w2 <- wk_doy[k + 1]
-  a <- (doy - w1) / (w2 - w1)
-  rw[[k]] * (1 - a) + rw[[k + 1]] * a
-}
-
-## 物种名/代码 -> ebirdst 本地下载路径
-.resolve_species_path <- function(species) {
-  ## 已经是本地路径
-  if (dir.exists(species)) return(normalizePath(species, mustWork = TRUE))
-  ## 示例物种直接放行
-  if (grepl("example$", species)) return(species)
-  code <- tryCatch(ebirdst::get_species_path(species),
-                   error = function(e) species)
-  code
-}
-
-## 把通用 season 映射到 ebirdst 的 period
-.season_to_ebirdst <- function(season, week, start_date, end_date) {
-  switch(season,
-    breeding               = list(period = "seasonal"),
-    nonbreeding            = list(period = "seasonal"),
-    prebreeding_migration  = list(period = "seasonal"),
-    postbreeding_migration = list(period = "seasonal"),
-    year_round             = list(period = "full-year"),
-    weekly = {
-      wk <- as.integer(week %||% 24)
-      stopifnot(wk >= 1, wk <= 52)
-      list(period = "weekly", week = wk)
-    },
-    custom = {
-      if (is.null(start_date) || is.null(end_date))
-        stop("season='custom' 时必须提供 start_date 和 end_date", call. = FALSE)
-      doy <- as.integer(format(as.Date(start_date) +
-                      (as.Date(end_date) - as.Date(start_date)) / 2, "%j"))
-      list(period = "custom", doy = doy)
-    },
-    list(period = "seasonal")
-  )
-}
 
 ## ============================================================================
 ## 3. 路径 B: 从 EBD/SED 清单数据从零建模 (hurdle 模型, 复刻官方教程)
@@ -1554,7 +1397,7 @@ plot.rel_abundance <- function(x, ...) {
 ## ----------------------------------------------------------------------------
 ## 小样本去噪: 对连续层 (遭遇率/计数/丰度) 做轻度 focal 均值平滑。
 ## in_range 是 0/1 范围掩膜, 不平滑 (保持分布边界清晰); 只在研究区内部平滑。
-## 数据量大、想完全复刻教程结果时可在 f.rel.ab(..., smooth = FALSE) 关闭。
+## 数据量大、想完全复刻教程结果时可在 map_local(..., smooth = FALSE) 关闭。
 ## ----------------------------------------------------------------------------
 .smooth_layers <- function(r, window = 3) {
   if (is.null(window) || !is.finite(window) || window <= 1) return(r)
